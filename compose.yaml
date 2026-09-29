@@ -1,0 +1,31 @@
+# Laya (System One classifier) on an NVIDIA GPU. Start with `docker compose up -d`;
+# the API is then on http://<this machine's LAN address>:8000 (port published on all interfaces).
+services:
+  laya:
+    build: ./docker/laya
+    ports:
+      - "8000:8000"
+    environment:
+      LAYA_DEVICE: cuda
+      LAYA_MODELS: multilingual,typed-decisions
+      # Set LAYA_API_KEY in .env to require `Authorization: Bearer <key>`.
+      LAYA_API_KEY: ${LAYA_API_KEY:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 5m
+    restart: on-failure:3
+
+volumes:
+  hf-cache:

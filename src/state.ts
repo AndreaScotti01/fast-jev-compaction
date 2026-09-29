@@ -20,10 +20,9 @@ const TOKEN_PIECES = /[A-Za-z]+|\d+|[^\sA-Za-z\d]/g;
 
 /**
  * Estimates tokens without a tokenizer: a word costs one token per six
- * letters, a digit half a token, any other symbol nine tenths. Calibrated
- * against the usage Jev reports for real transcripts, where it lands 2–18%
- * above the true count; a plain characters-per-token ratio undercounts the
- * JSON-heavy states by up to 40%.
+ * letters, a digit half a token, any other symbol nine tenths. Errs high
+ * on purpose: a plain characters-per-token ratio undercounts JSON-heavy states
+ * by up to 40%, and Laya cuts off anything over its max_len (8192 tokens at most).
  */
 export function estimateTokens(text: string): number {
   let tokens = 0;
@@ -82,6 +81,8 @@ export function collectToolCalls(
         callIndex,
         resultIndex: found.index,
         resultChars: found.result.text.length,
+        inputTokens: estimateTokens(inputText(tool.input, Number.POSITIVE_INFINITY)),
+        resultTokens: estimateTokens(found.result.text),
         isError: found.result.isError ?? false,
         pinned:
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
@@ -185,7 +186,7 @@ export function goalFromMessages(messages: readonly Message[]): string {
 }
 
 /**
- * Builds the Jev state from the whole conversation and shrinks it in stages
+ * Builds the Laya state from the whole conversation and shrinks it in stages
  * until it fits `maxStateTokens`: tool inputs are truncated, then long texts
  * are abridged oldest-first (pinned messages last), then old messages collapse
  * to a one-line note, then old tool calls shrink to one line each, then old
@@ -299,6 +300,6 @@ export function fitState(
   if (fits()) return fitted(history, tokens, 'old calls merged');
 
   throw new Error(
-    `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
+    `history too large for Laya (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
   );
 }

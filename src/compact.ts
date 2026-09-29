@@ -3,11 +3,12 @@ import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
+  CountedDecision,
   CompactOptions,
   CompactResult,
   CompactionState,
-  JevAsker,
-  JevQuestions,
+  LayaAsker,
+  LayaQuestions,
   Message,
   ResolvedCompactOptions,
   ToolCall,
@@ -18,8 +19,8 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  maxStateTokens: 7_000,
+  maxRequestTokens: 8_000,
   truncateHeadChars: 300,
 };
 
@@ -53,7 +54,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
 }
 
 /** The two `noul` questions asked about one call: keep the call, keep its result. */
-export function questionsFor(call: ToolCall): JevQuestions {
+export function questionsFor(call: ToolCall): LayaQuestions {
   return {
     [`call_${call.id}`]: {
       type: 'noul',
@@ -114,28 +115,60 @@ export function decideCall(
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
 }
 
+/** Tokens the truncation note adds after the kept head of a dropped result. */
+const TRUNCATION_NOTE_TOKENS = 25;
+
+/** Estimated tokens of one call that stay in and that leave the transcript for `action`. */
+export function decisionTokens(
+  call: Pick<ToolCall, 'inputTokens' | 'resultTokens' | 'resultChars'>,
+  action: CallDecision['action'],
+  headChars: number,
+): { tokensKept: number; tokensDropped: number } {
+  const total = call.inputTokens + call.resultTokens;
+  if (action === 'drop_call') return { tokensKept: 0, tokensDropped: total };
+  if (action === 'keep' || call.resultChars <= headChars + 120) {
+    return { tokensKept: total, tokensDropped: 0 };
+  }
+  const head = Math.ceil((call.resultTokens * headChars) / call.resultChars);
+  const keptResult = Math.min(call.resultTokens, head + TRUNCATION_NOTE_TOKENS);
+  return {
+    tokensKept: call.inputTokens + keptResult,
+    tokensDropped: call.resultTokens - keptResult,
+  };
+}
+
+interface BatchOutcome {
+  answers: Map<string, CallAnswer>;
+  stateTokens: number;
+  truncated: boolean;
+}
+
 async function askBatch(
-  asker: JevAsker,
+  asker: LayaAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
-  );
+): Promise<BatchOutcome> {
+  const questions: LayaQuestions = Object.assign({}, ...batch.map(questionsFor));
+  const { answers, usage } = await asker.ask(state, questions);
+  return {
+    answers: new Map(
+      batch.map((call) => [
+        call.id,
+        {
+          keepCall: noulAnswer(answers, `call_${call.id}`),
+          keepResult: noulAnswer(answers, `result_${call.id}`),
+        },
+      ]),
+    ),
+    stateTokens: usage?.state_tokens ?? 0,
+    truncated: usage?.truncated === true,
+  };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  return `${head}[laya-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }
@@ -238,6 +271,20 @@ export function messageChars(message: Message): number {
   return total;
 }
 
+/** Estimated tokens of the text, tool inputs and tool outputs a message holds. */
+export function messageTokens(message: Message): number {
+  let total = estimateTokens(message.text);
+  for (const tool of message.toolUses) {
+    try {
+      total += estimateTokens(JSON.stringify(tool.input));
+    } catch {
+      total += 10;
+    }
+  }
+  for (const result of message.toolResults ?? []) total += estimateTokens(result.text);
+  return total;
+}
+
 export function reductionRatio(result: Pick<CompactResult, 'stats'>): number {
   const { charsBefore, charsAfter } = result.stats;
   return charsBefore === 0 ? 0 : (charsBefore - charsAfter) / charsBefore;
@@ -248,15 +295,15 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 }
 
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
+ * Compacts a transcript by asking Laya, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
  * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
+ * sent as state with every batch of questions. Throws when Laya fails or the
  * history cannot be fitted; the caller decides whether to fall back.
  */
 export async function compact(
   messages: readonly Message[],
-  asker: JevAsker,
+  asker: LayaAsker,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
@@ -268,6 +315,8 @@ export async function compact(
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
   const answers = new Map<string, CallAnswer>();
+  let layaStateTokens = 0;
+  let stateTruncated = false;
   if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
@@ -275,12 +324,21 @@ export async function compact(
     const answered = await Promise.all(
       batches.map((batch) => askBatch(asker, state.state, batch)),
     );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    for (const outcome of answered) {
+      for (const [id, answer] of outcome.answers) answers.set(id, answer);
+      layaStateTokens = Math.max(layaStateTokens, outcome.stateTokens);
+      stateTruncated ||= outcome.truncated;
+    }
   }
 
-  const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
-  );
+  const decisions: CountedDecision[] = calls.map((call) => {
+    const decision = decideCall(
+      call,
+      answers.get(call.id) ?? { keepCall: 1, keepResult: 1 },
+      resolved,
+    );
+    return { ...decision, ...decisionTokens(call, decision.action, resolved.truncateHeadChars) };
+  });
   const kept = applyDecisions(
     messages,
     decisions,
@@ -295,6 +353,10 @@ export async function compact(
       messagesAfter: kept.length,
       charsBefore,
       charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+      tokensBefore: messages.reduce((sum, message) => sum + messageTokens(message), 0),
+      tokensAfter: kept.reduce((sum, message) => sum + messageTokens(message), 0),
+      layaStateTokens,
+      stateTruncated,
       calls: calls.length,
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),

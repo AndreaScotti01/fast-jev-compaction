@@ -1,19 +1,23 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
-  "license": "MIT",
+  "name": "laya-compaction",
+  "description": "Verbatim Laya-guided compaction for Claude Code sessions.",
   "userConfig": {
+    "baseUrl": {
+      "type": "string",
+      "title": "Laya server URL",
+      "description": "Address of the machine running laya-serve (docker compose) on your network, e.g. http://192.168.1.50:8000. Run /laya-status to test it.",
+      "required": true
+    },
     "apiKey": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "title": "Laya API key",
+      "description": "Bearer token, only needed when the server runs with LAYA_API_KEY. Leave empty to use LAYA_API_KEY from the environment, or none.",
       "sensitive": true
     },
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Minimum Laya probability that a tool call or tool result is still needed; below it the item is removed.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -36,27 +40,27 @@
     },
     "maxStateTokens": {
       "type": "number",
-      "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
+      "title": "Maximum Laya state tokens",
+      "description": "Estimated token budget for the conversation state sent with every Laya request. Laya reads 8192 tokens at most and cuts off the rest.",
+      "default": 7000
     },
     "maxRequestTokens": {
       "type": "number",
-      "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "title": "Maximum Laya request tokens",
+      "description": "Estimated token budget for state plus questions in one Laya request.",
+      "default": 8000
     },
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "description": "Characters of a tool result kept when Laya decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
     },
     "model": {
       "type": "string",
-      "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
-      "default": "jev-latest"
+      "title": "Laya model",
+      "description": "Checkpoint to ask: \"multilingual\" (trained for up to 8192 tokens) or \"typed-decisions\" (trained at 1024 tokens; lower the two token limits below to about 800 and 1000 to stay in that range).",
+      "default": "multilingual"
     }
   }
 }

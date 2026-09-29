@@ -9,11 +9,12 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { errorRecord, recordOf, type CompactionRecord } from '../src/stats-record.js';
+import { buildLayaRequest, DEFAULT_MODEL, layaServerUrl, parseLayaResponse } from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
-  JevAsker,
+  LayaAsker,
   Message,
   ToolResult,
   ToolUse,
@@ -40,8 +41,29 @@ export type HookFetchResponse = {
 /** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
 export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
 
+/** The shape of `$.clock.sleep`. */
+export type HookSleep = (ms: number, options?: { signal?: AbortSignal }) => Promise<void>;
+
+export const REQUEST_TIMEOUT_MS = 30_000;
+const STATUS_TIMEOUT_MS = 5_000;
+
+/** `$.http.fetch` has no timeout of its own; a server that is off must not hang `/compact`. */
+async function withTimeout<T>(work: Promise<T>, sleep: HookSleep, ms: number): Promise<T> {
+  const controller = new AbortController();
+  const timer = sleep(ms, { signal: controller.signal }).then((): never => {
+    throw new Error(`laya-serve did not answer within ${Math.round(ms / 1000)}s`);
+  });
+  timer.catch(() => undefined);
+  try {
+    return await Promise.race([work, timer]);
+  } finally {
+    controller.abort();
+  }
+}
+
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  baseUrl: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -79,6 +101,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    baseUrl: optionString(options, 'baseUrl') ?? '',
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -87,17 +110,22 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/** A `LayaAsker` over the engine's `$.http.fetch`. */
+export function layaAsker(
+  fetchFn: HookFetch,
+  connection: { apiKey?: string; model: string; baseUrl: string },
+  sleep?: HookSleep,
+): LayaAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
-      const response = await fetchFn(request.url, {
+      const request = buildLayaRequest(connection, state, questions);
+      const pending = fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body,
       });
-      return parseJevResponse(response.status, response.ok, response.text);
+      const response = sleep ? await withTimeout(pending, sleep, REQUEST_TIMEOUT_MS) : await pending;
+      return parseLayaResponse(response.status, response.ok, response.text);
     },
   };
 }
@@ -161,14 +189,14 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when the server fails or the history cannot be fitted. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  sleep?: HookSleep,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, layaAsker(fetchFn, config, sleep), config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -232,16 +260,133 @@ async function getApiKey(
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+  const fromEnv = await $.env.get('LAYA_API_KEY');
   if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
+    const value = (env as Record<string, unknown>)['LAYA_API_KEY'];
     if (typeof value === 'string' && value) return value;
   }
   return undefined;
 }
+
+/** The shape of `$.process.run`. */
+export type HookRun = (
+  argv: readonly string[],
+  init?: { stdin?: string; timeoutMs?: number },
+) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+
+const STATS_HELPER_TIMEOUT_MS = 10_000;
+const STATS_ARGUMENT = /^(all|\d+d?)$/i;
+
+/** Runs `dist/stats-cli.js` (node:sqlite lives outside the hook sandbox) and returns its stdout. */
+export async function runStatsCli(
+  run: HookRun,
+  pluginRoot: string,
+  args: readonly string[],
+  stdin?: string,
+): Promise<string> {
+  const result = await run(
+    ['node', '--no-warnings', `${pluginRoot}/dist/stats-cli.js`, ...args],
+    { ...(stdin === undefined ? {} : { stdin }), timeoutMs: STATS_HELPER_TIMEOUT_MS },
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr.trim() || `stats helper exited with ${result.exitCode}`);
+  }
+  return result.stdout;
+}
+
+/** Stores one compaction in the stats database; a failure is logged and never reaches compaction. */
+export async function saveStats(
+  run: HookRun,
+  pluginRoot: string,
+  record: CompactionRecord,
+  log: (text: string) => void,
+): Promise<void> {
+  try {
+    await runStatsCli(run, pluginRoot, ['record'], JSON.stringify(record));
+  } catch (error) {
+    log(`stats not recorded (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+/** The text of `/laya-stats [days|all]`. */
+export async function statsReport(run: HookRun, pluginRoot: string, args: string): Promise<string> {
+  const argument = args.trim() === '' ? 'all' : args.trim();
+  if (!STATS_ARGUMENT.test(argument)) {
+    return 'Usage: /laya-stats [days|all]   e.g. /laya-stats 7';
+  }
+  try {
+    return (await runStatsCli(run, pluginRoot, ['report', argument.replace(/d$/i, '')])).trimEnd();
+  } catch (error) {
+    return `Stats unavailable: ${error instanceof Error ? error.message : String(error)}
+They need Node.js 22.13+ on PATH and "npm run build" in the plugin folder.`;
+  }
+}
+
+/** `config.set` for the server URL row: normalizes a valid address, denies anything else. */
+export function validateServerUrl(value: unknown): { value: string } | { deny: string } {
+  if (typeof value !== 'string') return { deny: 'the Laya server URL must be text' };
+  try {
+    return { value: layaServerUrl(value) };
+  } catch (error) {
+    return { deny: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** What a Laya `/health` body says: the loaded models and the device, else the raw text. */
+export function healthSummary(text: string): string {
+  try {
+    const health = JSON.parse(text) as { loaded?: unknown; device?: unknown };
+    if (Array.isArray(health.loaded) && typeof health.device === 'string') {
+      return `models ${health.loaded.join(', ') || 'none'} on ${health.device}`;
+    }
+  } catch {
+    // not JSON: show it as is
+  }
+  return text.slice(0, 300);
+}
+
+/** The `/laya-status` report: the configured server, whether it answers `/health`, and how fast. */
+export async function layaStatus(
+  config: Pick<HookConfig, 'baseUrl' | 'apiKey'>,
+  fetchFn: HookFetch,
+  sleep: HookSleep,
+  now: () => Promise<number>,
+): Promise<string> {
+  const hint = 'Change it under /config → Laya server URL.';
+  let server: string;
+  try {
+    server = layaServerUrl(config.baseUrl);
+  } catch (error) {
+    return `Laya server URL is invalid: ${error instanceof Error ? error.message : String(error)}
+${hint}`;
+  }
+  const started = await now();
+  try {
+    const response = await withTimeout(
+      fetchFn(`${server}/health`, {
+        method: 'GET',
+        headers: config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {},
+      }),
+      sleep,
+      STATUS_TIMEOUT_MS,
+    );
+    const ms = (await now()) - started;
+    if (!response.ok) {
+      return `${server} answered HTTP ${response.status} after ${ms} ms: ${response.text.slice(0, 200)}
+${hint}`;
+    }
+    return `${server} is up (${ms} ms): ${healthSummary(response.text)}
+${hint}`;
+  } catch (error) {
+    return `${server} is unreachable: ${error instanceof Error ? error.message : String(error)}
+Is docker compose running on that machine, and is port 8000 open in its firewall? ${hint}`;
+  }
+}
+
+const SERVER_URL_ROW = /^laya-compaction(@[^.]*)?\.baseUrl$/;
 
 function notify(
   $: {
@@ -263,30 +408,79 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        $.clock.sleep,
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
-      if (reductionRatio(result) < config.minReductionRatio) {
+      const ratio = reductionRatio(result);
+      if (ratio < config.minReductionRatio) {
+        await saveStats($.process.run, $.plugin.root, recordOf(result, 'below_threshold', ratio), $.ui.log);
         notify(
           $,
           `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
         );
         return next(event);
       }
+      await saveStats($.process.run, $.plugin.root, recordOf(result, 'applied', ratio), $.ui.log);
       notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      await saveStats($.process.run, $.plugin.root, errorRecord(event.messages.length, reason), $.ui.log);
+      notify($, `fallback to built-in summary (${reason})`);
       return next(event);
     }
+  });
+
+  on('session.start', async ($, event, next) => {
+    try {
+      await $.command.register({
+        name: 'laya-status',
+        description: 'Check that the Laya server answers',
+      });
+      await $.command.register({
+        name: 'laya-stats',
+        description: 'Show how many tokens compaction let through and dropped',
+        argumentHint: '[days|all]',
+      });
+    } catch (error) {
+      $.ui.log(`slash commands not registered (${error instanceof Error ? error.message : String(error)})`);
+    }
+    return next(event);
+  });
+
+  on('command.run', { command: 'laya-status' }, async ($, event, next) => {
+    const config = { ...configured, apiKey: await getApiKey($, configured) };
+    const text = await layaStatus(
+      config,
+      async (url, init) => {
+        const response = await $.http.fetch(url, init);
+        return { status: response.status, ok: response.ok, text: response.text };
+      },
+      $.clock.sleep,
+      $.clock.now,
+    );
+    return { ...(await next(event)), text };
+  });
+
+  on('command.run', { command: 'laya-stats' }, async ($, event, next) => {
+    const text = await statsReport($.process.run, $.plugin.root, event.args);
+    return { ...(await next(event)), text };
+  });
+
+  on('config.set', ($, event, next) => {
+    if (!SERVER_URL_ROW.test(event.key)) return next(event);
+    const checked = validateServerUrl(event.value);
+    return 'deny' in checked ? { deny: checked.deny } : next({ ...event, value: checked.value });
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {

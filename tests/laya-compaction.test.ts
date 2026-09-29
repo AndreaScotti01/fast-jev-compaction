@@ -2,23 +2,22 @@ import { describe, expect, it } from 'vitest';
 import {
   applyDecisions,
   batchCalls,
-  buildJevRequest,
-  collectToolCalls,
   compact,
-  compactMessages,
   decideCall,
-  estimateTokens,
-  fitState,
-  JevClient,
-  parseJevResponse,
+  decisionTokens,
+  messageTokens,
   reductionRatio,
   resolveOptions,
-  type HistoryToolCall,
-  type JevAsker,
-  type JevQuestions,
-  type Message,
-  type ToolCall,
-} from '../src/index.js';
+} from '../src/compact.js';
+import { buildLayaRequest, parseLayaResponse } from '../src/request.js';
+import { collectToolCalls, estimateTokens, fitState } from '../src/state.js';
+import type {
+  HistoryToolCall,
+  LayaAsker,
+  LayaQuestions,
+  Message,
+  ToolCall,
+} from '../src/types.js';
 
 function message(role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
   return { role, text, toolUses: [], ...extra };
@@ -52,9 +51,9 @@ function transcript(): Message[] {
 
 type Seen = { state: unknown; questions: string[] };
 
-function fakeJev(answer: (name: string) => number, seen: Seen[] = []): JevAsker {
+function fakeLaya(answer: (name: string) => number, seen: Seen[] = []): LayaAsker {
   return {
-    async ask(state, questions: JevQuestions) {
+    async ask(state, questions: LayaQuestions) {
       seen.push({ state, questions: Object.keys(questions) });
       return {
         answers: Object.fromEntries(
@@ -76,8 +75,8 @@ describe('options', () => {
     expect(resolveOptions()).toMatchObject({
       keepThreshold: 0.5,
       preserveRecentMessages: 6,
-      maxStateTokens: 25_000,
-      maxRequestTokens: 30_000,
+      maxStateTokens: 7_000,
+      maxRequestTokens: 8_000,
       truncateHeadChars: 300,
     });
     expect(resolveOptions({
@@ -235,6 +234,8 @@ describe('question batching', () => {
     callIndex: i * 2 + 1,
     resultIndex: i * 2 + 2,
     resultChars: 100,
+    inputTokens: 5,
+    resultTokens: 25,
     isError: false,
     pinned: false,
   }));
@@ -294,10 +295,10 @@ describe('decisions', () => {
     expect(kept[0]).toBe(messages[0]);
     expect(kept[2]).not.toBe(messages[4]);
     expect(kept[2]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[laya-compaction truncated 1700 chars`),
     );
     expect(kept[3]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[laya-compaction truncated 1700 chars`),
     );
     expect(kept[2]).not.toBe(messages[4]);
     expect(kept[3]).not.toBe(messages[5]);
@@ -321,13 +322,13 @@ describe('decisions', () => {
 
     const kept = applyDecisions(messages, decisions, calls, 50);
     expect(kept[2]?.toolResults?.[0]?.text).toBe(
-      `${original.slice(0, 50)}\n[fast-jev-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
+      `${original.slice(0, 50)}\n[laya-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
     );
     expect(kept[1]?.toolUses[0]?.text).toBe(kept[2]?.toolResults?.[0]?.text);
 
     const noHead = applyDecisions(messages, decisions, calls, 0);
     expect(noHead[2]?.toolResults?.[0]?.text).toBe(
-      `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
+      `[laya-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
     );
   });
 });
@@ -343,7 +344,7 @@ describe('compact', () => {
     }).tokens;
     const output = await compact(
       messages,
-      fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
+      fakeLaya((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
       { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
     );
 
@@ -364,70 +365,116 @@ describe('compact', () => {
     expect(reductionRatio(output)).toBeGreaterThan(0);
   });
 
-  it('keeps everything without calling Jev when no tool call is a candidate', async () => {
+  it('keeps everything without calling Laya when no tool call is a candidate', async () => {
     const seen: Seen[] = [];
     const messages = [message('user', 'hello'), message('assistant', 'hi')];
-    const output = await compact(messages, fakeJev(() => 0, seen));
+    const output = await compact(messages, fakeLaya(() => 0, seen));
     expect(seen).toHaveLength(0);
     expect(output.stats).toMatchObject({ requests: 0, stateStage: '', calls: 0 });
     expect(output.messages).toEqual(messages);
   });
 
-  it('reports a tiny reduction when Jev wants everything kept', async () => {
-    const output = await compact(transcript(), fakeJev(() => 0.95), { preserveRecentMessages: 1 });
+  it('reports a tiny reduction when Laya wants everything kept', async () => {
+    const output = await compact(transcript(), fakeLaya(() => 0.95), { preserveRecentMessages: 1 });
     expect(output.decisions.every((d) => d.action === 'keep')).toBe(true);
     expect(reductionRatio(output)).toBe(0);
   });
 
   it('rejects malformed answers', async () => {
-    const broken: JevAsker = {
+    const broken: LayaAsker = {
       ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
     };
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
-      /Invalid Jev answer/,
+      /Invalid Laya answer/,
     );
   });
 });
 
-describe('HTTP client', () => {
-  it('builds a System One request', () => {
-    const request = buildJevRequest({ apiKey: 'k' }, { a: 1 }, {
+describe('request building', () => {
+  it('builds a laya-serve request', () => {
+    const request = buildLayaRequest({ apiKey: 'k', baseUrl: 'http://192.168.1.50:8000' }, { a: 1 }, {
       q: { type: 'noul', instructions: 'x' },
     });
-    expect(request.url).toBe('https://api.typesafe.ai/v1/systemone');
+    expect(request.url).toBe('http://192.168.1.50:8000/v1/systemone');
     expect(request.headers.authorization).toBe('Bearer k');
     expect(JSON.parse(request.body)).toEqual({
-      model: 'jev-latest',
+      model: 'multilingual',
+      max_len: 8192,
       state: { a: 1 },
       questions: { q: { type: 'noul', instructions: 'x' } },
     });
   });
 
   it('rejects failed and malformed responses', () => {
-    expect(() => parseJevResponse(500, false, 'boom')).toThrow(/500/);
-    expect(() => parseJevResponse(200, true, 'not json')).toThrow(/malformed/);
-    expect(() => parseJevResponse(200, true, '{}')).toThrow(/missing answers/);
-    expect(parseJevResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });
+    expect(() => parseLayaResponse(500, false, 'boom')).toThrow(/500/);
+    expect(() => parseLayaResponse(200, true, 'not json')).toThrow(/malformed/);
+    expect(() => parseLayaResponse(200, true, '{}')).toThrow(/missing answers/);
+    expect(parseLayaResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });
   });
 
-  it('asks over fetch and refuses to run without a key', async () => {
-    const bodies: string[] = [];
-    const client = new JevClient({
-      apiKey: 'k',
-      model: 'jev-test',
-      fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
-        bodies.push(String(init?.body));
-        return new Response(JSON.stringify({ answers: { q: { noul: 0.4 } } }), { status: 200 });
-      }) as typeof fetch,
-    });
-    const response = await client.ask('state', { q: { type: 'noul', instructions: 'x' } });
-    expect(response.answers.q).toEqual({ noul: 0.4 });
-    expect(JSON.parse(bodies[0]!).model).toBe('jev-test');
+  it('sends no authorization header without a key', () => {
+    const request = buildLayaRequest({ baseUrl: 'http://pc:8000' }, 's', {});
+    expect(request.headers).toEqual({ 'content-type': 'application/json' });
+  });
 
-    const keyless = new JevClient({ apiKey: '' });
-    await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY/);
-    await expect(
-      compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
-    ).rejects.toThrow(/TYPESAFE_API_KEY/);
+  it('refuses to guess a server when none is configured', () => {
+    expect(() => buildLayaRequest({ baseUrl: '' }, 's', {})).toThrow(/no Laya server URL/);
+  });
+});
+
+describe('token accounting', () => {
+  const sized = { inputTokens: 10, resultTokens: 400, resultChars: 1600 };
+
+  it('splits a call into tokens kept and dropped per action', () => {
+    expect(decisionTokens(sized, 'keep', 300)).toEqual({ tokensKept: 410, tokensDropped: 0 });
+    expect(decisionTokens(sized, 'drop_call', 300)).toEqual({ tokensKept: 0, tokensDropped: 410 });
+    const truncated = decisionTokens(sized, 'drop_result', 300);
+    expect(truncated.tokensKept + truncated.tokensDropped).toBe(410);
+    expect(truncated.tokensDropped).toBeGreaterThan(0);
+    expect(truncated.tokensKept).toBeGreaterThan(10);
+    expect(decisionTokens({ ...sized, resultChars: 200 }, 'drop_result', 300)).toEqual({
+      tokensKept: 410,
+      tokensDropped: 0,
+    });
+  });
+
+  it('adds up to the transcript totals when whole calls are dropped', async () => {
+    const output = await compact(transcript(), fakeLaya(() => 0.1), { preserveRecentMessages: 1 });
+    expect(output.decisions.every((d) => d.action === 'drop_call' || d.reason === 'pinned')).toBe(true);
+    const dropped = output.decisions.reduce((sum, d) => sum + d.tokensDropped, 0);
+    expect(dropped).toBeGreaterThan(0);
+    expect(output.stats.tokensBefore - output.stats.tokensAfter).toBe(dropped);
+    expect(output.stats.tokensBefore).toBe(transcript().reduce((sum, m) => sum + messageTokens(m), 0));
+    for (const d of output.decisions) {
+      expect(d.tokensKept + d.tokensDropped).toBeGreaterThan(0);
+    }
+  });
+
+  it('keeps everything and drops nothing when every answer says keep', async () => {
+    const output = await compact(transcript(), fakeLaya(() => 0.95), { preserveRecentMessages: 1 });
+    expect(output.decisions.reduce((sum, d) => sum + d.tokensDropped, 0)).toBe(0);
+    expect(output.stats.tokensAfter).toBe(output.stats.tokensBefore);
+  });
+
+  it('reports what Laya says about the state it read', async () => {
+    const asker: LayaAsker = {
+      async ask(_state, questions) {
+        return {
+          answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { type: 'noul' as const, noul: 0.9 }])),
+          usage: { state_tokens: 8332, truncated: true },
+        };
+      },
+    };
+    const output = await compact(transcript(), asker, { preserveRecentMessages: 1 });
+    expect(output.stats.layaStateTokens).toBe(8332);
+    expect(output.stats.stateTruncated).toBe(true);
+    const plain = await compact(transcript(), fakeLaya(() => 0.9), { preserveRecentMessages: 1 });
+    expect(plain.stats.stateTruncated).toBe(false);
+    expect(plain.stats.layaStateTokens).toBe(0);
+  });
+
+  it('estimates tokens of a message from text, inputs and outputs', () => {
+    const m = transcript()[1]!;
+    expect(messageTokens(m)).toBeGreaterThanOrEqual(estimateTokens(m.text));
   });
 });
